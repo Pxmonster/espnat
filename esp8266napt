@@ -14,13 +14,17 @@ struct Config {
   char ap_password[64]; // AP模式的密码
 };
 
+// 设备信息结构定义
+struct DeviceInfo {
+  String macAddress;
+  IPAddress ipAddress;
+};
+
 // 全局变量
 Config config; // 配置结构实例
 ESP8266WebServer server(80); // 创建Web服务器实例，监听80端口
-
-// EEPROM配置
-#define EEPROM_SIZE sizeof(Config) // EEPROM大小定义为配置结构的大小
-#define EEPROM_START 0 // EEPROM起始地址
+DeviceInfo connectedDevices[9]; // 存储已连接设备信息的数组
+int deviceCount = 0; // 已连接设备数量
 
 // 默认配置
 const char DEFAULT_STA_SSID[] = "CMCC-198"; // 默认STA模式SSID
@@ -61,6 +65,10 @@ const char CONFIG_HTML[] PROGMEM = R"rawliteral(
   <div class="status">
     <p>设备状态：%device_status%</p>
     <p>IP地址：%device_ip%</p>
+    <h2>已连接设备</h2>
+    <ul>
+      %connected_devices%
+    </ul>
   </div>
 </body>
 </html>
@@ -74,9 +82,8 @@ String htmlEscape(const char* str); // 函数声明
 
 // 加载配置
 void loadConfig() {
-  EEPROM.begin(EEPROM_SIZE); // 初始化EEPROM
-  EEPROM.get(EEPROM_START, config); // 从EEPROM读取配置
-  EEPROM.end(); // 结束EEPROM操作
+  EEPROM.begin(sizeof(Config)); // 初始化EEPROM
+  EEPROM.get(0, config); // 从EEPROM读取配置
 
   // 校验配置有效性
   if (strlen(config.sta_ssid) == 0 || strlen(config.ap_ssid) == 0) {
@@ -90,10 +97,17 @@ void loadConfig() {
 
 // 保存配置
 void saveConfig() {
-  EEPROM.begin(EEPROM_SIZE); // 初始化EEPROM
-  EEPROM.put(EEPROM_START, config); // 将配置写入EEPROM
-  EEPROM.commit(); // 提交EEPROM写入
-  EEPROM.end(); // 结束EEPROM操作
+  EEPROM.put(0, config); // 将配置写入EEPROM
+  EEPROM.commit(); // 提交EEPROM更改
+}
+
+// 分配IP地址
+IPAddress assignIPAddress() {
+  if (deviceCount < 9) {
+    return IPAddress(192, 168, 4, 2 + deviceCount);
+  } else {
+    return IPAddress(0, 0, 0, 0); // 无可用IP地址
+  }
 }
 
 // 处理根请求
@@ -112,6 +126,12 @@ void handleRoot() {
     
   html.replace("%device_status%", status); // 替换设备状态占位符
   html.replace("%device_ip%", WiFi.softAPIP().toString()); // 替换设备IP地址占位符
+  
+  String connectedDevicesHtml = "";
+  for (int i = 0; i < deviceCount; i++) {
+    connectedDevicesHtml += "<li>MAC地址: " + connectedDevices[i].macAddress + ", IP地址: " + connectedDevices[i].ipAddress.toString() + "</li>";
+  }
+  html.replace("%connected_devices%", connectedDevicesHtml); // 替换已连接设备信息占位符
   
   server.send(200, "text/html", html); // 发送HTML页面
 }
@@ -227,6 +247,32 @@ void setup() {
       Serial.println("\nSTA连接失败，请检查配置"); // 输出连接失败信息
     }
   }
+
+  // 处理设备连接事件
+  WiFi.onSoftAPModeStationConnected([](const WiFiEventSoftAPModeStationConnected& evt) {
+    if (deviceCount < 9) {
+      char macStr[18];
+      snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X", evt.mac[0], evt.mac[1], evt.mac[2], evt.mac[3], evt.mac[4], evt.mac[5]);
+      connectedDevices[deviceCount].macAddress = String(macStr);
+      connectedDevices[deviceCount].ipAddress = assignIPAddress();
+      deviceCount++;
+    }
+  });
+
+  // 处理设备断开事件
+  WiFi.onSoftAPModeStationDisconnected([](const WiFiEventSoftAPModeStationDisconnected& evt) {
+    char macStr[18];
+    snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X", evt.mac[0], evt.mac[1], evt.mac[2], evt.mac[3], evt.mac[4], evt.mac[5]);
+    for (int i = 0; i < deviceCount; i++) {
+      if (connectedDevices[i].macAddress == String(macStr)) {
+        for (int j = i; j < deviceCount - 1; j++) {
+          connectedDevices[j] = connectedDevices[j + 1];
+        }
+        deviceCount--;
+        break;
+      }
+    }
+  });
 }
 
 #else
