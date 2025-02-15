@@ -1,0 +1,273 @@
+#include <SoftwareSerial.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266mDNS.h>
+#include <WiFiUdp.h>
+#include <ESPMiio.h>
+
+SoftwareSerial mySerial(12, 13);
+
+#define AP_SSID "tabs7"
+#define AP_PASSWORD "208220823"
+const char *ssid = AP_SSID;
+const char *pass = AP_PASSWORD;
+IPAddress ip(192, 168, 10, 105);
+IPAddress gateway(192, 168, 1, 1);
+IPAddress subnet(255, 255, 255, 0);
+
+#define MAX_DEVICES 5
+
+struct MiioDeviceInfo {
+    IPAddress ip;
+    String token;
+    String name;
+    MiioDevice *device;
+};
+
+MiioDeviceInfo devices[MAX_DEVICES];
+int deviceCount = 0;
+
+unsigned long lastPingTime = 0;
+const unsigned long pingInterval = 60000;
+
+void handleUserInput(String input);
+void checkWiFiConnection();
+void queryDeviceStatus(MiioDevice &device);
+bool addDevice(String ipStr, String tokenStr, String deviceName);
+void sendFeedback(String feedback);
+void listDevices();
+
+void setup() {
+    Serial.begin(9600);
+    mySerial.begin(9600);
+    Serial.println("Setup Complete");
+
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, pass);
+    WiFi.config(ip, gateway, subnet);
+
+    while (WiFi.waitForConnectResult() != WL_CONNECTED) {
+        Serial.println("Connection Failed! Rebooting...");
+        delay(1000);
+        ESP.restart();
+    }
+
+    Serial.println("Connected to WiFi");
+}
+
+bool addDevice(String ipStr, String tokenStr, String deviceName) {
+    if (deviceCount >= MAX_DEVICES) {
+        sendFeedback("Cannot add more devices, maximum limit reached");
+        return false;
+    }
+
+    IPAddress ip;
+    if (!ip.fromString(ipStr)) {
+        sendFeedback("Invalid IP address format");
+        return false;
+    }
+
+    // 检查设备是否已经存在
+    for (int i = 0; i < deviceCount; i++) {
+        if (devices[i].ip == ip && devices[i].token == tokenStr) {
+            sendFeedback("Device already exists. IP: " + ipStr + " Token: " + tokenStr);
+            return false;
+        }
+    }
+
+    devices[deviceCount].ip = ip;  
+    devices[deviceCount].token = tokenStr;  
+    devices[deviceCount].name = deviceName;
+    devices[deviceCount].device = new MiioDevice(&devices[deviceCount].ip, devices[deviceCount].token.c_str(), 5000);
+
+    devices[deviceCount].device->connect([=](MiioError e) {
+        sendFeedback("Connecting to device " + String(deviceCount + 1));
+    });
+
+    deviceCount++;
+    sendFeedback("Device added successfully");
+    return true;
+}
+
+
+bool removeDevice(int deviceNumber) {
+    if (deviceNumber < 1 || deviceNumber > deviceCount) {
+        return false;
+    }
+    for (int i = deviceNumber - 1; i < deviceCount - 1; i++) {
+        devices[i] = devices[i + 1];
+    }
+    deviceCount--;
+    return true;
+}
+
+void sendFeedback(String feedback) {
+    mySerial.println(feedback);
+    Serial.println(feedback);
+}
+
+void listDevices() {
+    if (deviceCount == 0) {
+        sendFeedback("No devices added.");
+        return;
+    }
+    String feedback = "Added devices:";
+    for (int i = 0; i < deviceCount; i++) {
+        feedback += "\n" + devices[i].name + " (" + devices[i].ip.toString() + ")";
+    }
+    sendFeedback(feedback);
+}
+
+void handleUserInput(String input) {
+    input.trim();
+    String feedback;
+
+    if (input.startsWith("add ")) {
+        int firstSpace = input.indexOf(' ', 4);
+        int secondSpace = input.indexOf(' ', firstSpace + 1);
+        if (firstSpace == -1 || secondSpace == -1) {
+            feedback = "Invalid add command format. Use: add [ip] [token] [name]";
+        } else {
+            String ipStr = input.substring(4, firstSpace);
+            String tokenStr = input.substring(firstSpace + 1, secondSpace);
+            String deviceName = input.substring(secondSpace + 1);
+
+            if (addDevice(ipStr, tokenStr, deviceName)) {
+                feedback = "Device added successfully";
+            } else {
+                feedback = "Failed to add device";
+            }
+        }
+    }
+    else if (input.startsWith("remove ")) {
+        int deviceNumber = input.substring(7).toInt();
+        if (removeDevice(deviceNumber)) {
+            sendFeedback("Device removed successfully");
+        } else {
+            sendFeedback("Invalid device number");
+        }
+    }
+    else if (input.startsWith("list")) {
+        listDevices();
+    }
+    else if (input.length() > 2 && input.indexOf(' ') != -1) {
+        String deviceName = input.substring(0, input.indexOf(' '));
+        String command = input.substring(input.indexOf(' ') + 1);
+        int deviceIndex = -1;
+        for (int i = 0; i < deviceCount; i++) {
+            if (devices[i].name == deviceName) {
+                deviceIndex = i;
+                break;
+            }
+        }
+
+        if (deviceIndex != -1) {
+            MiioDevice *targetDevice = devices[deviceIndex].device;
+
+            if (command == "on") {
+                targetDevice->send("set_power", "[\"on\"]", [](MiioResponse response) {
+                    if (!response.getResult().isNull()) {
+                        sendFeedback("Light turned on successfully");
+                    } else {
+                        sendFeedback("Failed to turn on the light");
+                    }
+                }, [](MiioError e) {
+                    sendFeedback("Error turning on the light: " + String(e));
+                });
+            } else if (command == "off") {
+                targetDevice->send("set_power", "[\"off\"]", [](MiioResponse response) {
+                    if (!response.getResult().isNull()) {
+                        sendFeedback("Light turned off successfully");
+                    } else {
+                        sendFeedback("Failed to turn off the light");
+                    }
+                }, [](MiioError e) {
+                    sendFeedback("Error turning off the light: " + String(e));
+                });
+            } else if (command.startsWith("light ")) {
+                int brightness = command.substring(6).toInt();
+                if (brightness >= 0 && brightness <= 100) {
+                    String brightnessCommand = String("[") + brightness + "]";
+                    targetDevice->send("set_bright", brightnessCommand.c_str(), [](MiioResponse response) {
+                        if (!response.getResult().isNull()) {
+                            sendFeedback("Brightness adjusted successfully");
+                        } else {
+                            sendFeedback("Failed to adjust brightness");
+                        }
+                    }, [](MiioError e) {
+                        sendFeedback("Error adjusting brightness: " + String(e));
+                    });
+                } else {
+                    sendFeedback("Invalid brightness value. Please enter a value between 0 and 100.");
+                }
+            } else if (command.startsWith("color ")) {
+                int colorTemp = command.substring(6).toInt();
+                if (colorTemp >= 2600 && colorTemp <= 6500) {
+                    String colorTempCommand = String("[") + colorTemp + "]";
+                    targetDevice->send("set_ct_abx", colorTempCommand.c_str(), [](MiioResponse response) {
+                        if (!response.getResult().isNull()) {
+                            sendFeedback("Color temperature adjusted successfully");
+                        } else {
+                            sendFeedback("Failed to adjust color temperature");
+                        }
+                    }, [](MiioError e) {
+                        sendFeedback("Error adjusting color temperature: " + String(e));
+                    });
+                } else {
+                    sendFeedback("Invalid color temperature value. Please enter a value between 2600K and 6500K.");
+                }
+            } else {
+                sendFeedback("Unknown command. Please use 'on', 'off', 'light [0-100]' or 'color [2600-6500]'.");
+            }
+        } else {
+            sendFeedback("Device not found");
+        }
+    } else {
+        sendFeedback("Invalid command format");
+    }
+}
+
+void checkWiFiConnection() {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi lost connection, reconnecting...");
+        WiFi.disconnect();
+        WiFi.begin(ssid, pass);
+        while (WiFi.status() != WL_CONNECTED) {
+            delay(500);
+            Serial.print(".");
+        }
+        Serial.println("Reconnected to WiFi");
+    }
+}
+
+void queryDeviceStatus(MiioDevice &device) {
+    device.send("get_prop", "[\"power\"]", [](MiioResponse response) {
+        // 不发送状态信息到串口
+        if (response.getResult().isNull()) {
+            sendFeedback("Failed to get status of the device");
+        }
+    }, [](MiioError e) {
+        sendFeedback("Error getting status of device: " + String(e));
+    });
+}
+
+void loop() {
+    checkWiFiConnection();
+
+    if (millis() - lastPingTime > pingInterval) {
+        lastPingTime = millis();
+        Serial.println("Querying device status...");
+        for (int i = 0; i < deviceCount; i++) {
+            queryDeviceStatus(*devices[i].device);
+        }
+    }
+
+    if (Serial.available()) {
+        String input = Serial.readStringUntil('\n');
+        handleUserInput(input);
+    }
+
+    if (mySerial.available()) {
+        String receivedData = mySerial.readStringUntil('\n');
+        handleUserInput(receivedData);
+    }
+}
