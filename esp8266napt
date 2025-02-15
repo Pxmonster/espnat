@@ -1,0 +1,245 @@
+#include <EEPROM.h> // 引入EEPROM库，用于存储配置
+#include <ESP8266WiFi.h> // 引入ESP8266WiFi库，用于WiFi功能
+#include <ESP8266WebServer.h> // 引入ESP8266WebServer库，用于Web服务器功能
+#include <lwip/napt.h> // 引入NAPT库，用于网络地址端口转换
+#include <lwip/dns.h> // 引入DNS库，用于域名解析
+
+#if LWIP_FEATURES && !LWIP_IPV6 // 检查是否支持LWIP特性且不支持IPv6
+
+// 配置结构定义
+struct Config {
+  char sta_ssid[32]; // STA模式的SSID
+  char sta_password[64]; // STA模式的密码
+  char ap_ssid[32]; // AP模式的SSID
+  char ap_password[64]; // AP模式的密码
+};
+
+// 全局变量
+Config config; // 配置结构实例
+ESP8266WebServer server(80); // 创建Web服务器实例，监听80端口
+
+// EEPROM配置
+#define EEPROM_SIZE sizeof(Config) // EEPROM大小定义为配置结构的大小
+#define EEPROM_START 0 // EEPROM起始地址
+
+// 默认配置
+const char DEFAULT_STA_SSID[] = "CMCC-198"; // 默认STA模式SSID
+const char DEFAULT_STA_PASS[] = "12345678"; // 默认STA模式密码
+const char DEFAULT_AP_SSID[] = "ESP8266NAPT"; // 默认AP模式SSID
+const char DEFAULT_AP_PASS[] = "12345678"; // 默认AP模式密码
+
+// 配置页面HTML
+const char CONFIG_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <title>WiFi配置</title>
+  <meta charset="UTF-8">
+  <style>
+    body { font-family: Arial; padding: 20px; }
+    .section { margin: 20px 0; padding: 20px; border: 1px solid #ddd; }
+    input { margin: 10px 0; padding: 8px; width: 90%; max-width: 300px; }
+    button { background: #4CAF50; color: white; padding: 12px 24px; border: none; cursor: pointer; }
+    .status { color: #666; margin-top: 20px; }
+  </style>
+</head>
+<body>
+  <h1>WiFi配置</h1>
+  
+  <div class="section">
+    <h2>上级网络 (STA)</h2>
+    <form action="/save" method="POST">
+      <input type="text" name="sta_ssid" placeholder="WiFi名称" value="%sta_ssid%" required>
+      <input type="password" name="sta_pass" placeholder="WiFi密码" value="%sta_pass%">
+      <h2>扩展网络 (AP)</h2>
+      <input type="text" name="ap_ssid" placeholder="扩展器名称" value="%ap_ssid%" required>
+      <input type="password" name="ap_pass" placeholder="扩展器密码" value="%ap_pass%" required>
+      <button type="submit">保存配置</button>
+    </form>
+  </div>
+
+  <div class="status">
+    <p>设备状态：%device_status%</p>
+    <p>IP地址：%device_ip%</p>
+  </div>
+</body>
+</html>
+)rawliteral"; // 配置页面的HTML代码
+
+// 保存配置
+void saveConfig(); // 函数声明
+
+// HTML转义
+String htmlEscape(const char* str); // 函数声明
+
+// 加载配置
+void loadConfig() {
+  EEPROM.begin(EEPROM_SIZE); // 初始化EEPROM
+  EEPROM.get(EEPROM_START, config); // 从EEPROM读取配置
+  EEPROM.end(); // 结束EEPROM操作
+
+  // 校验配置有效性
+  if (strlen(config.sta_ssid) == 0 || strlen(config.ap_ssid) == 0) {
+    strncpy(config.sta_ssid, DEFAULT_STA_SSID, sizeof(config.sta_ssid)); // 使用默认STA模式SSID
+    strncpy(config.sta_password, DEFAULT_STA_PASS, sizeof(config.sta_password)); // 使用默认STA模式密码
+    strncpy(config.ap_ssid, DEFAULT_AP_SSID, sizeof(config.ap_ssid)); // 使用默认AP模式SSID
+    strncpy(config.ap_password, DEFAULT_AP_PASS, sizeof(config.ap_password)); // 使用默认AP模式密码
+    saveConfig(); // 保存默认配置
+  }
+}
+
+// 保存配置
+void saveConfig() {
+  EEPROM.begin(EEPROM_SIZE); // 初始化EEPROM
+  EEPROM.put(EEPROM_START, config); // 将配置写入EEPROM
+  EEPROM.commit(); // 提交EEPROM写入
+  EEPROM.end(); // 结束EEPROM操作
+}
+
+// 处理根请求
+void handleRoot() {
+  String html = FPSTR(CONFIG_HTML); // 获取配置页面HTML
+  
+  // 替换占位符
+  html.replace("%sta_ssid%", htmlEscape(config.sta_ssid)); // 替换STA模式SSID占位符
+  html.replace("%sta_pass%", htmlEscape(config.sta_password)); // 替换STA模式密码占位符
+  html.replace("%ap_ssid%", htmlEscape(config.ap_ssid)); // 替换AP模式SSID占位符
+  html.replace("%ap_pass%", htmlEscape(config.ap_password)); // 替换AP模式密码占位符
+  
+  String status = WiFi.status() == WL_CONNECTED ? 
+    "已连接到上级网络 (" + String(config.sta_ssid) + ")" : 
+    "未连接上级网络"; // 获取设备连接状态
+    
+  html.replace("%device_status%", status); // 替换设备状态占位符
+  html.replace("%device_ip%", WiFi.softAPIP().toString()); // 替换设备IP地址占位符
+  
+  server.send(200, "text/html", html); // 发送HTML页面
+}
+
+// 处理保存请求
+void handleSave() {
+  if (server.method() != HTTP_POST) {
+    server.send(405, "text/plain", "Method Not Allowed"); // 如果不是POST请求，返回405错误
+    return;
+  }
+
+  // 获取并验证参数
+  String staSsid = server.arg("sta_ssid"); // 获取STA模式SSID
+  String staPass = server.arg("sta_pass"); // 获取STA模式密码
+  String apSsid = server.arg("ap_ssid"); // 获取AP模式SSID
+  String apPass = server.arg("ap_pass"); // 获取AP模式密码
+
+  if (staSsid.length() == 0 || apSsid.length() == 0 || apPass.length() < 8) {
+    server.send(400, "text/plain", "参数无效：AP密码至少需要8个字符"); // 如果参数无效，返回400错误
+    return;
+  }
+
+  // 保存配置
+  staSsid.toCharArray(config.sta_ssid, sizeof(config.sta_ssid)); // 保存STA模式SSID
+  staPass.toCharArray(config.sta_password, sizeof(config.sta_password)); // 保存STA模式密码
+  apSsid.toCharArray(config.ap_ssid, sizeof(config.ap_ssid)); // 保存AP模式SSID
+  apPass.toCharArray(config.ap_password, sizeof(config.ap_password)); // 保存AP模式密码
+  saveConfig(); // 保存配置到EEPROM
+
+  server.send(200, "text/html", 
+    "<script>"
+    "alert('配置已保存，设备即将重启');"
+    "setTimeout(() => window.location.href='/', 3000);"
+    "</script>"); // 返回保存成功提示
+    
+  delay(3000); // 延时3秒
+  ESP.restart(); // 重启设备
+}
+
+// HTML转义
+String htmlEscape(const char* str) {
+  String s = str; // 将C字符串转换为String对象
+  s.replace("&", "&amp;"); // 替换&符号
+  s.replace("\"", "&quot;"); // 替换"符号
+  s.replace("'", "&#39;"); // 替换'符号
+  s.replace("<", "&lt;"); // 替换<符号
+  s.replace(">", "&gt;"); // 替换>符号
+  return s; // 返回转义后的字符串
+}
+
+// 初始化Web服务器
+void initWebServer() {
+  server.on("/", handleRoot); // 处理根请求
+  server.on("/save", handleSave); // 处理保存请求
+  server.begin(); // 启动Web服务器
+  Serial.println("HTTP服务器已启动"); // 输出启动信息
+}
+
+// NAPT配置
+#define NAPT 1000 // NAPT配置参数
+#define NAPT_PORT 10 // NAPT端口配置
+
+void setup() {
+  Serial.begin(115200); // 初始化串口
+  Serial.println("\n\nNAPT扩展器启动..."); // 输出启动信息
+
+  // 加载配置
+  loadConfig(); // 加载配置
+
+  // 初始化WiFi
+  WiFi.mode(WIFI_AP_STA); // 设置WiFi模式为AP+STA
+  
+  // 配置AP
+  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), 
+                   IPAddress(192, 168, 4, 1), 
+                   IPAddress(255, 255, 255, 0)); // 配置AP的IP地址
+  WiFi.softAP(config.ap_ssid, config.ap_password); // 启动AP
+  Serial.printf("配置AP: %s, IP: %s\n", 
+    config.ap_ssid, WiFi.softAPIP().toString().c_str()); // 输出AP配置信息
+
+  // 启动Web服务器
+  initWebServer(); // 初始化Web服务器
+
+  // 连接STA网络
+  if (strlen(config.sta_ssid) > 0) {
+    WiFi.begin(config.sta_ssid, config.sta_password); // 连接STA网络
+    
+    Serial.print("正在连接STA网络: ");
+    Serial.print(config.sta_ssid); // 输出连接信息
+    
+    for (int i = 0; i < 20; i++) {
+      if (WiFi.status() == WL_CONNECTED) break; // 如果连接成功，跳出循环
+      Serial.print("."); // 输出等待信息
+      delay(500); // 延时500毫秒
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.printf("\nSTA连接成功! IP: %s\n", 
+        WiFi.localIP().toString().c_str()); // 输出连接成功信息
+        
+      // 初始化NAPT
+      Serial.printf("初始化前堆内存: %d\n", ESP.getFreeHeap()); // 输出初始化前的堆内存
+      err_t ret = ip_napt_init(NAPT, NAPT_PORT); // 初始化NAPT
+      
+      if (ret == ERR_OK) {
+        ip_napt_enable_no(SOFTAP_IF, 1); // 启用NAPT
+        Serial.println("NAPT初始化成功"); // 输出初始化成功信息
+        Serial.printf("当前堆内存: %d\n", ESP.getFreeHeap()); // 输出当前堆内存
+      } else {
+        Serial.println("NAPT初始化失败"); // 输出初始化失败信息
+      }
+    } else {
+      Serial.println("\nSTA连接失败，请检查配置"); // 输出连接失败信息
+    }
+  }
+}
+
+#else
+
+void setup() {
+  Serial.begin(115200); // 初始化串口
+  Serial.println("\n当前固件不支持NAPT功能"); // 输出不支持NAPT功能信息
+}
+
+#endif
+
+void loop() {
+  #if LWIP_FEATURES && !LWIP_IPV6
+  server.handleClient(); // 处理客户端请求
+  #endif
+}
